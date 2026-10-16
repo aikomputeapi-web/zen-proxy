@@ -85,8 +85,11 @@ describe("sessionFor IDs satisfy the descending-timestamp gate", () => {
     for (const h of body.slice(0, 12)) flipped = (flipped << 4n) | BigInt(parseInt(h, 16))
     // After inversion the value DESCENDS as time advances (larger now_ms =>
     // smaller inverted value), so 'minted within the last minute' means flipped
-    // lies between the inverted now and the inverted a-minute-ago stamps.
-    const hi = ~(BigInt(Date.now()) * 4096n) & 0xffffffffffffn
+    // lies between the inverted now-plus-margin and the inverted a-minute-ago
+    // stamps. Forward margin: the suite may read the clock a hair before the
+    // module minted the ID (coarse clock ticks), and the gate itself tolerates
+    // 30 minutes of staleness, so 5s is nothing.
+    const hi = ~(BigInt(Date.now() + 5_000) * 4096n) & 0xffffffffffffn
     const lo = ~(BigInt(Date.now() - 60_000) * 4096n) & 0xffffffffffffn
     assert.ok(flipped >= hi && flipped <= lo, `inverted stamp ${flipped.toString(16)} in window [${hi.toString(16)}, ${lo.toString(16)}]`)
     // tail must be base62 per the upstream alphabet
