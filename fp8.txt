@@ -1,0 +1,4 @@
+SENT big-pickle stream=true ntools=4
+SENT space-bunny-free stream=true ntools=4
+STATUS 200
+BODY {"model":"big-pickle","choices":[{"message":{"role":"assistant","content":"hi"}}],"zen_served_by":"space-bunny-free"}

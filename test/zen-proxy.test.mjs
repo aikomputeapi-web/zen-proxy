@@ -403,10 +403,13 @@ describe("auto-UA tracking", () => {
   test("refreshUA adopts a newer opencode version and persists it", async () => {
     zp.saveConfig({ autoUA: true, ua: "opencode/1.18.30" })
     globalThis.fetch = routeFetch([
+      // auto-UA tracks the 2.x CLI package (opencode/latest/<v>/cli) since the
+      // 2026-10-11 free-tier gate; the 1.x installer shim is no longer consulted.
+      ["registry.npmjs.org/@opencode/cli/latest", jsonResponse({ version: "3.1.4" })],
       ["registry.npmjs.org/opencode-ai/latest", jsonResponse({ version: "9.9.9" })],
     ])
     await zp.refreshUA(true)
-    assert.equal(zp.config.ua, "opencode/9.9.9", "UA must track the latest opencode version")
+    assert.equal(zp.config.ua, "opencode/latest/3.1.4/cli", "UA must track the latest @opencode/cli version")
   })
 
   test("refreshUA leaves custom User-Agents untouched", async () => {

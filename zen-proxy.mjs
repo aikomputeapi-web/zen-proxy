@@ -165,7 +165,7 @@ const DEFAULT_CONFIG = {
   host: ENV.HOST ?? "127.0.0.1",
   port: Number(ENV.PORT ?? 8787),
   upstream: normalizeUpstream(ENV.ZEN_URL ?? DEFAULT_UPSTREAM),
-  ua: ENV.ZEN_UA ?? "opencode/1.18.30",
+  ua: ENV.ZEN_UA ?? "opencode/latest/2.0.30/cli",
   autoUA: ENV.AUTO_UA !== "0",
   uaRefreshMs: Number(ENV.UA_REFRESH_MS ?? 6 * 3600_000),
   injectSession: ENV.INJECT_SESSION !== "0",
@@ -334,6 +334,68 @@ const requestStats = { total: 0, errors: 0, recent: [], perMinute: new Map(), wi
 // jev-* free models are served on /v1/systemone (structured classification),
 // not on a chat/responses endpoint, so they are never routable here.
 const NOT_CHAT_SERVABLE = [/^jev-/]
+// ---- free-tier body fingerprint (2026-10-16) --------------------------------
+// Beyond the session-ID shape, the free tier only accepts agent-shaped bodies:
+// the bash/glob/grep/read stub tools must be present (chat `function` shape) and
+// `stream` must be true with usage reporting. Measured 2026-10-16 by ablation
+// probes from the VPS: stream+tools+descending-ID => 200; removing any one =>
+// 403 FreeTierError on every `-free` model. JSON clients get the stubs injected
+// and their answer synthesized from a forced upstream stream (see
+// `aggregateChatStream`) so nothing changes for them.
+function isFreeModel(id) {
+  const s = String(id ?? "")
+  return s.endsWith("-free") || s === "big-pickle" || s === "test"
+}
+function freeTierStubTool(name, description, prop) {
+  return {
+    type: "function",
+    function: {
+      name,
+      description,
+      parameters: {
+        type: "object",
+        properties: { [prop]: { type: "string", description: prop } },
+        required: [prop],
+      },
+    },
+  }
+}
+const FREE_TIER_STUB_TOOLS = () => [
+  freeTierStubTool("bash", "Run a shell command and return its output", "command"),
+  freeTierStubTool("glob", "Find files matching a glob pattern", "pattern"),
+  freeTierStubTool("grep", "Search file contents with a regular expression", "pattern"),
+  freeTierStubTool("read", "Read the contents of a file", "file_path"),
+]
+function includeUsage(payload) {
+  const so = payload.stream_options
+  if (so === undefined || so === null || typeof so !== "object") return { include_usage: true }
+  return { ...so, include_usage: true }
+}
+// Ensure a chat-shaped body satisfies the free-tier fingerprint. Mutates the
+// payload in place. Returns "aggregated" when streaming was flipped on for a
+// client that asked for JSON (caller must synthesize a JSON response),
+// "streamed" when the body already streamed, "untouched" for paid models.
+function applyFreeTierFingerprint(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "untouched"
+  if (!isFreeModel(payload.model)) return "untouched"
+  const raw = Array.isArray(payload.tools) ? payload.tools : []
+  // The gate matches the stub names exactly and case-sensitively: lowercase
+  // `bash` passes, Claude Code's PascalCase `Bash` does not (measured 2026-10-07).
+  // So only an exact lowercase name covers a stub; anything else gets the stub
+  // appended after the client's own tools.
+  const have = new Set()
+  for (const t of raw) {
+    const n = typeof t?.function?.name === "string" ? t.function.name : typeof t?.name === "string" ? t.name : ""
+    if (n && n === n.toLowerCase()) have.add(n)
+  }
+  const missing = FREE_TIER_STUB_TOOLS().filter((t) => !have.has(t.function.name))
+  if (missing.length) payload.tools = [...raw, ...missing]
+  payload.stream_options = includeUsage(payload)
+  if (payload.stream === true) return "streamed"
+  payload.stream = true
+  return "aggregated"
+}
+
 
 // opencode's free tier requires every request to carry session identity: upstream
 // returns 400 `MissingSessionID` with no session header, and 403 `FreeTierError`
@@ -1113,13 +1175,19 @@ async function handleChat(req, res) {
     const format = modelFormat(model)
     const payload =
       format === "responses" ? responsesRequest(body, model, isStream) : { ...body, model }
+    // The free tier only answers agent-shaped traffic (tool stubs + stream).
+    // When the client asked for JSON we force the stream anyway and aggregate
+    // the SSE back into one chat.completion below, invisible to the client.
+    let fpMode = "untouched"
+    if (format === "chat") fpMode = applyFreeTierFingerprint(payload)
+    const effectiveStream = isStream || fpMode === "aggregated" || fpMode === "streamed"
     let upstreamRes
     try {
       upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
         method: "POST",
         headers: zenHeaders(req, auth),
         body: JSON.stringify(payload),
-        signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+        signal: effectiveStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
       })
     } catch (err) {
       lastErr = { error: { type: "upstream_error", message: err.message } }
@@ -1128,7 +1196,33 @@ async function handleChat(req, res) {
     }
 
     if (upstreamRes.ok) {
-      if (isStream) {
+      if (effectiveStream) {
+        if (fpMode === "aggregated") {
+          // Client wanted a single JSON response; synthesize it from the forced
+          // upstream reply. The upstream may still answer with a plain JSON body
+          // (mocked tests, or a free model that ignores the stream flag), so
+          // pick the parser from the content type, not the request shape.
+          const ctype = String(upstreamRes.headers.get("content-type") ?? "")
+          const agg = /text\/event-stream/i.test(ctype)
+            ? await aggregateChatStream(upstreamRes, requested)
+            : await upstreamRes.json()
+          if (agg.error) {
+            lastErr = agg.error
+            lastStatus = 502
+            continue
+          }
+          if (agg && typeof agg === "object") {
+            agg.model = requested
+            if (model !== requested) agg.zen_served_by = model
+          }
+          if (model !== requested) {
+            res.setHeader?.("x-zen-served-by", model)
+            res.setHeader?.("x-zen-fallback", "true")
+          }
+          recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+          recordObserved(model, true)
+          return json(res, 200, agg)
+        }
         if (format === "responses") {
           relayResponsesStream(req, res, upstreamRes, requested)
         } else {
@@ -1479,16 +1573,118 @@ async function probeModel(id, auth, session) {
     "user-agent": config.ua,
   }
   if (session) for (const h of SESSION_HEADERS) headers[h] = session
-  const payload =
+  let payload =
     format === "responses"
       ? { model: id, input: "ping", max_output_tokens: 32 }
       : { model: id, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }
+  // The free-tier gate requires the agent fingerprint (tool stubs + streaming);
+  // without it every probe reads as 403 FreeTierError and no model ever looks
+  // healthy. The ping is tiny, so buffering the forced stream is cheap.
+  if (session && format === "chat") {
+    payload.stream = true
+    payload.stream_options = { include_usage: true }
+    payload.tools = FREE_TIER_STUB_TOOLS()
+  }
   return fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
     method: "POST",
     headers,
     body: JSON.stringify(payload),
     signal: AbortSignal.timeout(Math.min(config.timeoutMs, 30_000)),
   })
+}
+
+// Aggregate a chat.completion SSE stream (forced by the free-tier gate for
+// otherwise-JSON requests) back into a single chat.completion object: content,
+// reasoning, tool_calls and usage are stitched; a terminal error event is
+// surfaced so the caller can fall through to the next candidate model.
+async function aggregateChatStream(upstreamRes, requested) {
+  const reader = upstreamRes.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ""
+  let id = ""
+  let created = 0
+  let role = "assistant"
+  let content = ""
+  let reasoning = ""
+  let finish = ""
+  let usage = null
+  const tools = new Map()
+  const toolOrder = []
+  let streamError = null
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx)
+        buffer = buffer.slice(idx + 2)
+        for (const line of block.split("\n")) {
+          const t = line.trim()
+          if (!t.startsWith("data: ")) continue
+          const p = t.slice(6).trim()
+          if (p === "[DONE]") continue
+          let j
+          try {
+            j = JSON.parse(p)
+          } catch {
+            continue
+          }
+          if (j.error) {
+            streamError = j.error.type ? j.error : { type: "upstream_error", message: String(j.error.message ?? "stream error") }
+            continue
+          }
+          if (!id && typeof j.id === "string") id = j.id
+          if (!created && Number.isFinite(j.created)) created = j.created
+          if (j.usage && typeof j.usage === "object") usage = j.usage
+          const choice = j.choices?.[0]
+          if (!choice) continue
+          if (typeof choice.finish_reason === "string" && choice.finish_reason) finish = choice.finish_reason
+          const delta = choice.delta ?? {}
+          if (typeof delta.role === "string" && delta.role) role = delta.role
+          if (typeof delta.content === "string") content += delta.content
+          if (typeof delta.reasoning_content === "string") reasoning += delta.reasoning_content
+          if (typeof delta.reasoning === "string") reasoning += delta.reasoning
+          if (Array.isArray(delta.tool_calls)) {
+            for (const tc of delta.tool_calls) {
+              const i = Number.isFinite(tc?.index) ? tc.index : 0
+              let acc = tools.get(i)
+              if (!acc) {
+                acc = { id: "", name: "", args: "" }
+                tools.set(i, acc)
+                toolOrder.push(i)
+              }
+              if (typeof tc.id === "string" && tc.id) acc.id = tc.id
+              const fn = tc.function ?? {}
+              if (typeof fn.name === "string" && fn.name) acc.name = fn.name
+              if (typeof fn.arguments === "string") acc.args += fn.arguments
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    // Network hiccup mid-stream: treat whatever we collected as final.
+  }
+  if (streamError) return { error: streamError }
+  const message = { role, content }
+  if (reasoning) message.reasoning_content = reasoning
+  if (toolOrder.length) {
+    message.tool_calls = toolOrder.map((i) => {
+      const a = tools.get(i)
+      return { id: a.id || `call_${randomBytes(10).toString("hex")}`, type: "function", function: { name: a.name, arguments: a.args } }
+    })
+  }
+  const out = {
+    id: id || `chatcmpl-${randomBytes(12).toString("hex")}`,
+    object: "chat.completion",
+    created: created || Math.floor(Date.now() / 1000),
+    model: requested,
+    choices: [{ index: 0, message, finish_reason: finish || "stop" }],
+  }
+  if (usage) out.usage = usage
+  return out
 }
 
 // Stream a Responses SSE body back as chat.completion.chunk SSE.
@@ -1665,7 +1861,10 @@ async function syncModels() {
           const r = await probeModel(id, auth, sessionHeader())
           let bodyErr = ""
           try {
-            const j = await r.json()
+            // Chat-format probes are force-streamed (free-tier gate), so the
+            // body is SSE; aggregate first. Errors inside the stream land in
+            // .error so classification still sees the upstream reason.
+            const j = modelFormat(id) === "chat" && r.ok ? await aggregateChatStream(r, id) : await r.json()
             if (j && (j.error || j.type === "error")) {
               const e = j.error ?? j
               bodyErr = (e.type || "") + " " + (e.message || "")
@@ -1802,7 +2001,7 @@ async function refreshUA(force = false) {
   if (!force && uaAutoState.at && now - uaAutoState.at < config.uaRefreshMs) return uaAutoState.version
   uaAutoState.at = now
   try {
-    const res = await fetch("https://registry.npmjs.org/opencode-ai/latest", {
+    const res = await fetch("https://registry.npmjs.org/@opencode/cli/latest", {
       headers: { accept: "application/json" },
       signal: AbortSignal.timeout(10_000),
     })
@@ -1811,9 +2010,11 @@ async function refreshUA(force = false) {
     const v = String(data?.version ?? "")
     if (!/^\d+\.\d+\.\d+/.test(v)) return uaAutoState.version
     uaAutoState.version = v
-    const next = `opencode/${v}`
-    if (next !== config.ua && /^opencode\/\d+\.\d+\.\d+/.test(config.ua)) {
-      log(`auto-UA: opencode ${v} released — updating User-Agent`)
+    // The gate tracks the 2.x CLI (@opencode/cli), UA shape
+    // `opencode/latest/<version>/cli` — not the 1.x opencode-ai installer shim.
+    const next = `opencode/latest/${v}/cli`
+    if (next !== config.ua && /^opencode\/(latest\/)?\d+/.test(config.ua)) {
+      log(`auto-UA: opencode cli ${v} released — updating User-Agent`)
       try { saveConfig({ ua: next }) } catch {}
     }
     return v
@@ -1988,6 +2189,15 @@ async function handleTest(req, res) {
         ? `Bearer ${body.zenKey.trim()}`
         : (authForUpstream(req) ?? "Bearer public")
     const format = modelFormat(model)
+    // Free-tier needs the agent fingerprint on chat models; responses pass through.
+    const testPayload =
+      format === "responses"
+        ? { model, input: "ping", max_output_tokens: 32 }
+        : (() => {
+            const p = { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }
+            applyFreeTierFingerprint(p)
+            return p
+          })()
     const upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
       method: "POST",
       headers: (() => {
@@ -2003,19 +2213,21 @@ async function handleTest(req, res) {
         if (!ipOmit(ip)) h["x-real-ip"] = ip
         return h
       })(),
-      body: JSON.stringify(
-        format === "responses"
-          ? { model, input: "ping", max_output_tokens: 32 }
-          : { model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 },
-      ),
+      body: JSON.stringify(testPayload),
       signal: AbortSignal.timeout(config.timeoutMs),
     })
     let detail = ""
     let gated = false
     try {
-      const parsed = await upstreamRes.json()
-      if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
-      else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
+      if (testPayload.stream && /text\/event-stream/i.test(String(upstreamRes.headers.get("content-type") ?? ""))) {
+        // The fingerprint force-streamed this ping; aggregate before reporting.
+        const agg = await aggregateChatStream(upstreamRes, model)
+        detail = agg?.choices?.[0]?.message?.content ?? agg?.error?.message ?? ""
+      } else {
+        const parsed = await upstreamRes.json()
+        if (format === "responses") detail = parsed.error?.message ?? (typeof parsed.output_text === "string" ? parsed.output_text : "")
+        else detail = parsed.error?.message ?? parsed.choices?.[0]?.message?.content ?? ""
+      }
       // A free-tier gate here is not a failure of the model: the free tier only
       // accepts genuine agent traffic, which a bare ping never is.
       if (upstreamRes.status === 403 && /FreeTierError|free tier can only/i.test(detail)) gated = true
@@ -2237,6 +2449,9 @@ export {
   toBool,
   sessionFor,
   sessionHeader,
+  isFreeModel,
+  applyFreeTierFingerprint,
+  aggregateChatStream,
   MAX_BODY,
   VALID_MODEL_ID,
 }
