@@ -3,3 +3,8 @@ node_modules/
 zen-proxy.json
 *.log
 .DS_Store
+""  
+"# scratch/debug artifacts"  
+"fp*.txt"  
+"repro-*.mjs"  
+"trace.txt"  
