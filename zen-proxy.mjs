@@ -1079,13 +1079,21 @@ async function handleMessages(req, res) {
     used = model
     const format = modelFormat(model)
     const payload = format === "responses" ? responsesRequest(anthropicToChatBody(body, model), model, isStream) : anthropicToChatBody(body, model)
+    // The free tier also requires the agent-shaped body fingerprint (stream +
+    // stub tools) on the Anthropic path; the agent-tools.json bridge only ships
+    // tools the caller has counterparts for, so a bare messages request may
+    // carry none. Same rule as the OpenAI path: force the shape and synthesize
+    // JSON for non-streaming clients.
+    let fpMode = "untouched"
+    if (format === "chat") fpMode = applyFreeTierFingerprint(payload)
+    const effectiveStream = isStream || fpMode === "aggregated" || fpMode === "streamed"
     let upstreamRes
     try {
       upstreamRes = await fetch(`${config.upstream}${format === "responses" ? "/responses" : "/chat/completions"}`, {
         method: "POST",
         headers: zenHeaders(req, auth),
         body: JSON.stringify(payload),
-        signal: isStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
+        signal: effectiveStream ? req.signal : AbortSignal.timeout(config.timeoutMs),
       })
     } catch (err) {
       lastErr = { error: { type: "api_error", message: err.message } }
@@ -1100,7 +1108,26 @@ async function handleMessages(req, res) {
     }
 
     if (upstreamRes.ok) {
-      if (isStream) {
+      if (effectiveStream) {
+        if (fpMode === "aggregated") {
+          // We flipped the stream for a JSON client; synthesize the answer.
+          // Parser follows the actual response content type (a mocked or
+          // non-compliant upstream may answer plain JSON despite stream:true).
+          const ctype = String(upstreamRes.headers.get("content-type") ?? "")
+          const agg = /text\/event-stream/i.test(ctype)
+            ? await aggregateChatStream(upstreamRes, requested)
+            : await upstreamRes.json()
+          if (agg.error) {
+            lastErr = agg.error
+            lastStatus = 502
+            continue
+          }
+          const shaped = format === "responses" ? responsesToChat(agg, requested, model) : agg
+          if (shaped && typeof shaped === "object" && model !== requested) shaped.zen_served_by = model
+          recordReq(req, `${requested}→${model}`, Date.now() - start, 200)
+          recordObserved(model, true)
+          return json(res, 200, chatToAnthropic(shaped, requested, model))
+        }
         const chunks = format === "responses" ? responsesChunksAsChat(upstreamRes) : sseChunks(upstreamRes)
         relayAnthropicStream(req, res, chunks, requested, model)
         res.on("finish", () => {
